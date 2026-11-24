@@ -1,0 +1,58 @@
+# Builds and publishes the prebuilt Lean files IMD's pequalnp.com desk runs on (scripts/pequalnp.sh), for one commit of
+# brilliant-hq/pequalnp-proofs. Run by hand: gh workflow run pequalnp.yml -f ref=<commit, branch or tag>.
+name: pequalnp bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: brilliant-hq/pequalnp-proofs commit, branch or tag to build
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pequalnp-bundle
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: bundles
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: brilliant-hq/pequalnp-proofs
+          ref: ${{ inputs.ref }}
+          path: project
+          persist-credentials: false
+      - name: Make room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get install -y -qq time zstd >/dev/null
+          df -h /
+      - name: Build, pack and check
+        id: bundle
+        run: bash bundles/scripts/pequalnp.sh "$GITHUB_WORKSPACE/project" "$RUNNER_TEMP/out"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ steps.bundle.outputs.release }}
+          LEAN_ASSET: ${{ steps.bundle.outputs.lean_asset }}
+          PROJECT_ASSET: ${{ steps.bundle.outputs.project_asset }}
+        run: |
+          cd "$RUNNER_TEMP/out"
+          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$RELEASE is already published; a release is never replaced"
+            exit 1
+          fi
+          gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --notes-file notes.md \
+            "$LEAN_ASSET" "$PROJECT_ASSET" fetch.json setup.txt
