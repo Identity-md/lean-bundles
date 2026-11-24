@@ -70,10 +70,13 @@ cat > "$root/imd-env.sh" <<EOF
 # Sourced before any Lean command in an IMD goal item. IMD_FETCH is the workspace's .imd/fetch folder:
 #   export IMD_FETCH="\$PWD/.imd/fetch" && . "\$IMD_FETCH/pequalnp/imd-env.sh" && lean <file>
 # Built from brilliant-hq/pequalnp-proofs $commit, Lean $version, Mathlib $mathlib_rev.
-: "\${IMD_FETCH:?set IMD_FETCH to the workspace's .imd/fetch folder first}"
+: "\${IMD_FETCH:?set IMD_FETCH to the .imd/fetch folder of the workspace first}"
 export PATH="\$IMD_FETCH/lean/$lean_top/bin:\$PATH"
 export LEAN_PATH="$rewritten"
 EOF
+# Items may source it from sh or bash: both must read it before anything is packed.
+sh -n "$root/imd-env.sh"
+bash -n "$root/imd-env.sh"
 
 echo "::group::Pack"
 # Git folders and the C the compiler emits are not needed to elaborate; everything else stays, licences included.
