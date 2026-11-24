@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Builds brilliant-hq/pequalnp-proofs' Lean project against Mathlib's prebuilt cache and packs two bundles for IMD's
-# outside proof desks: the Lean toolchain the project names, as Lean publishes it, and the project with every .olean
-# built. A goal item gets each read only at .imd/fetch/<name>/, so nothing here relies on Lake at run time: imd-env.sh
-# puts the toolchain on PATH and the built libraries on LEAN_PATH, and `lean <file>` elaborates writing nothing.
-# Before publishing, both are unpacked in another folder, made read only, and a file importing Mathlib and the project
-# is elaborated there with the build folder moved away, so a bundle that leans on this runner's paths fails here.
+# Builds brilliant-hq/pequalnp-proofs' Lean project against Mathlib's prebuilt cache and packs three bundles for IMD's
+# outside proof desks: the Lean toolchain the project names, as Lean publishes it (`lean`); the project's packages,
+# Mathlib and what it needs, built (`lean-packages`); and the project itself, built (`pequalnp`). Nothing built is left
+# out but the git folders: Mathlib uses Lean's module system, whose interpreter reads the IR files beside the .olean
+# ones, so a tactic of Mathlib's needs them to run.
+#
+# A goal item gets each read only at .imd/fetch/<name>/, so nothing relies on Lake at run time: imd-env.sh puts the
+# toolchain on PATH and the built libraries on LEAN_PATH, and `lean <file>` elaborates writing nothing. The check file
+# is elaborated twice before anything is published: in the built project through Lake, and then from the three bundles
+# unpacked in another folder, read only, with the build moved away, so a bundle leaning on this runner's paths fails.
 #
 #   bash scripts/pequalnp.sh <checkout of pequalnp-proofs> <output folder>
 set -euo pipefail
@@ -32,6 +36,7 @@ esac
 tag=${toolchain#leanprover/lean4:}
 version=${tag#v}
 lean_asset="lean-$version-linux.tar.zst"
+packages_asset="pequalnp-$short-packages-lean-$version-linux-x64.tar.zst"
 project_asset="pequalnp-$short-lean-$version-linux-x64.tar.zst"
 
 echo "::group::Lean $version"
@@ -51,14 +56,61 @@ lake exe cache get
 lake build
 mathlib_rev=$(jq -r '.packages[] | select(.name == "mathlib") | .rev' lake-manifest.json)
 lean_path=$(lake env printenv LEAN_PATH)
+echo "LEAN_PATH from Lake: $lean_path"
+echo "built .olean files in the packages: $(find "$root/.lake/packages" -name '*.olean' | wc -l), in the project: $(find "$root/.lake/build" -name '*.olean' | wc -l)"
 echo "::endgroup::"
 
-# LEAN_PATH as an item has it: every entry under the project or the toolchain, rewritten under $IMD_FETCH.
+# What the check imports: a Mathlib module the project itself imports, so it exists in this Mathlib, and the project's
+# library root (or its first module).
+mathlib_import=$(grep -rhoE '^[[:space:]]*(public[[:space:]]+)?(meta[[:space:]]+)?import[[:space:]]+Mathlib(\.[A-Za-z0-9_]+)+' \
+  "$root/$project_lib" "$root/$project_lib.lean" 2>/dev/null | awk '{print $NF}' | sort | head -n 1 || true)
+[ -n "$mathlib_import" ] || { echo "::error::no file of $project_lib imports a Mathlib module"; exit 1; }
+if [ -f "$root/$project_lib.lean" ]; then project_import=$project_lib
+else
+  first=$(cd "$root" && find "$project_lib" -name '*.lean' | sort | head -n 1 || true)
+  [ -n "$first" ] || { echo "::error::no $project_lib module in the project"; exit 1; }
+  project_import=$(printf '%s' "${first%.lean}" | tr / .)
+fi
+echo "the check imports $mathlib_import and $project_import"
+write_check() {
+  mkdir -p "$1"
+  cat > "$1/Check.lean" <<EOF
+import $mathlib_import
+import $project_import
+
+theorem imd_bundle_check : 2 + 2 = 4 := by decide
+
+#print axioms imd_bundle_check
+EOF
+}
+olean_of() { printf '%s/%s.olean' "$1" "$(printf '%s' "$2" | tr . /)"; }
+# Where an import's .olean is, under every LEAN_PATH entry: what to print when a check fails.
+where_is() {
+  local module=$1 paths=$2 entry
+  IFS=: read -r -a dirs <<< "$paths"
+  for entry in "${dirs[@]}"; do
+    [ -n "$entry" ] || continue
+    if [ -f "$(olean_of "$entry" "$module")" ]; then echo "  $module: found under $entry"; return; fi
+  done
+  echo "  $module: no .olean under any LEAN_PATH entry"
+}
+
+echo "::group::Check in the built project"
+write_check "$work/in-place"
+(cd "$root" && lake env lean "$work/in-place/Check.lean") || {
+  echo "::error::the check file does not elaborate in the built project itself"
+  where_is "$mathlib_import" "$lean_path"; where_is "$project_import" "$lean_path"
+  exit 1
+}
+echo "::endgroup::"
+
+# LEAN_PATH as an item has it: every entry rewritten under $IMD_FETCH, to the bundle it is in.
 rewritten=""
 IFS=: read -r -a entries <<< "$lean_path"
 for entry in "${entries[@]}"; do
   [ -n "$entry" ] || continue
   case "$entry" in
+    "$root"/.lake/packages/*) mapped="\$IMD_FETCH/lean-packages/${entry#"$root"/.lake/packages/}" ;;
     "$root"/*) mapped="\$IMD_FETCH/pequalnp/${entry#"$root"/}" ;;
     "$lean_dir"/*) mapped="\$IMD_FETCH/lean/$lean_top/${entry#"$lean_dir"/}" ;;
     *) echo "::error::LEAN_PATH names $entry, outside the project and the toolchain"; exit 1 ;;
@@ -79,12 +131,12 @@ sh -n "$root/imd-env.sh"
 bash -n "$root/imd-env.sh"
 
 echo "::group::Pack"
-# Git folders and the C the compiler emits are not needed to elaborate; everything else stays, licences included.
 find "$root/.lake" -name .git -prune -exec rm -rf {} +
-find "$root/.lake" -type d -path '*/.lake/build/ir' -prune -exec rm -rf {} +
 rm -rf "$root/.git"
-tar --sort=name --owner=0 --group=0 --numeric-owner -C "$root" -cf - . | zstd -T0 -15 -q -o "$out/$project_asset"
-for asset in "$lean_asset" "$project_asset"; do
+pack() { tar --sort=name --owner=0 --group=0 --numeric-owner "$@" | zstd -T0 -15 -q -o "$out/$asset"; }
+asset=$packages_asset pack -C "$root/.lake/packages" -cf - .
+asset=$project_asset pack -C "$root" --exclude=./.lake/packages -cf - .
+for asset in "$lean_asset" "$packages_asset" "$project_asset"; do
   size=$(stat -c %s "$out/$asset")
   echo "$asset: $size bytes"
   if [ "$size" -gt "$max_asset" ]; then echo "::error::$asset is $size bytes, past a release file's 2 GiB"; exit 1; fi
@@ -94,26 +146,14 @@ echo "::endgroup::"
 echo "::group::Check from another folder, read only"
 check=$work/check
 fetch=$check/.imd/fetch
-mkdir -p "$fetch/lean" "$fetch/pequalnp" "$check/item"
+mkdir -p "$fetch/lean" "$fetch/lean-packages" "$fetch/pequalnp"
 tar --zstd -xf "$out/$lean_asset" -C "$fetch/lean"
+tar --zstd -xf "$out/$packages_asset" -C "$fetch/lean-packages"
 tar --zstd -xf "$out/$project_asset" -C "$fetch/pequalnp"
 chmod -R a-w "$fetch"
 mv "$root" "$root.moved"
 mv "$work/toolchain" "$work/toolchain.moved"
-if [ -f "$fetch/pequalnp/$project_lib.lean" ]; then project_import=$project_lib
-else
-  first=$(cd "$fetch/pequalnp" && find "$project_lib" -name '*.lean' | sort | head -n 1)
-  [ -n "$first" ] || { echo "::error::no $project_lib module in the bundle"; exit 1; }
-  project_import=$(printf '%s' "${first%.lean}" | tr / .)
-fi
-cat > "$check/item/Check.lean" <<EOF
-import Mathlib.Logic.Basic
-import $project_import
-
-theorem imd_bundle_check : 2 + 2 = 4 := by decide
-
-#print axioms imd_bundle_check
-EOF
+write_check "$check/item"
 check_log=$work/check.log
 (
   cd "$check/item"
@@ -121,7 +161,12 @@ check_log=$work/check.log
   export IMD_FETCH="$fetch"
   . "$IMD_FETCH/pequalnp/imd-env.sh"
   /usr/bin/time -v lean Check.lean
-) > "$check_log" 2>&1 || { cat "$check_log"; echo "::error::the bundle did not elaborate from another folder"; exit 1; }
+) > "$check_log" 2>&1 || {
+  cat "$check_log"
+  echo "::error::the bundles did not elaborate from another folder"
+  where_is "$mathlib_import" "$(IMD_FETCH=$fetch; eval "printf '%s' \"$rewritten\"")"
+  exit 1
+}
 cat "$check_log"
 grep -q "imd_bundle_check" "$check_log" || { echo "::error::lean printed no axioms line"; exit 1; }
 peak_kb=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "$check_log")
@@ -130,24 +175,18 @@ seconds=$(sed -n 's/.*Elapsed (wall clock) time (h:mm:ss or m:ss): //p' "$check_
 seconds=${seconds:-unmeasured}
 echo "::endgroup::"
 
-content_sha() { zstd -dc "$1" | sha256sum | cut -d' ' -f1; }
-lean_sha=$(sha256sum "$out/$lean_asset" | cut -d' ' -f1)
-project_sha=$(sha256sum "$out/$project_asset" | cut -d' ' -f1)
-lean_bytes=$(stat -c %s "$out/$lean_asset")
-project_bytes=$(stat -c %s "$out/$project_asset")
-lean_content=$(content_sha "$out/$lean_asset")
-project_content=$(content_sha "$out/$project_asset")
-
 release=pequalnp-$short
 base="https://github.com/${GITHUB_REPOSITORY:-Identity-md/lean-bundles}/releases/download/$release"
-jq -n \
-  --arg lu "$base/$lean_asset" --arg ls "$lean_sha" --argjson lb "$lean_bytes" --arg lc "$lean_content" \
-  --arg pu "$base/$project_asset" --arg ps "$project_sha" --argjson pb "$project_bytes" --arg pc "$project_content" \
-  '[{name: "lean", url: $lu, sha256: $ls, bytes: $lb, unpack: "tar.zst", contentSha256: $lc},
-    {name: "pequalnp", url: $pu, sha256: $ps, bytes: $pb, unpack: "tar.zst", contentSha256: $pc}]' > "$out/fetch.json"
+entry() {
+  local name=$1 file=$2
+  jq -n --arg name "$name" --arg url "$base/$file" --arg sha "$(sha256sum "$out/$file" | cut -d' ' -f1)" \
+    --argjson bytes "$(stat -c %s "$out/$file")" --arg content "$(zstd -dc "$out/$file" | sha256sum | cut -d' ' -f1)" \
+    '{name: $name, url: $url, sha256: $sha, bytes: $bytes, unpack: "tar.zst", contentSha256: $content}'
+}
+{ entry lean "$lean_asset"; entry lean-packages "$packages_asset"; entry pequalnp "$project_asset"; } | jq -s . > "$out/fetch.json"
 
 cat > "$out/setup.txt" <<'EOF'
-Lean and the project, with Mathlib built, are prebuilt and read only at .imd/fetch/lean and .imd/fetch/pequalnp. Each command is a fresh shell, so run every Lean command from the workspace root as one line: export IMD_FETCH="$PWD/.imd/fetch" && . "$IMD_FETCH/pequalnp/imd-env.sh" && lean <file>. Write your file in your own workspace, never inside .imd/fetch. Never run lake build, lake update or lake exe cache: the project is read only and already built. A file that elaborates with no error and no sorry warning is accepted by Lean.
+Lean, Mathlib with the packages it needs, and the project are prebuilt and read only at .imd/fetch/lean, .imd/fetch/lean-packages and .imd/fetch/pequalnp. Each command is a fresh shell, so run every Lean command from the workspace root as one line: export IMD_FETCH="$PWD/.imd/fetch" && . "$IMD_FETCH/pequalnp/imd-env.sh" && lean <file>. Write your file in your own workspace, never inside .imd/fetch. Never run lake build, lake update or lake exe cache: everything is read only and already built. A file that elaborates with no error and no sorry warning is accepted by Lean.
 EOF
 
 {
@@ -156,26 +195,25 @@ EOF
   echo "lean=$version"
   echo "mathlib=$mathlib_rev"
   echo "lean_asset=$lean_asset"
+  echo "packages_asset=$packages_asset"
   echo "project_asset=$project_asset"
-  echo "peak_kb=$peak_kb"
-  echo "seconds=$seconds"
 } >> "${GITHUB_OUTPUT:-/dev/null}"
 
-cat > "$out/notes.md" <<EOF
-Prebuilt Lean files for IMD's outside proof desk on [pequalnp.com](https://pequalnp.com), built by this repository's workflow on GitHub's runner.
-
-| | |
-|---|---|
-| Project | [brilliant-hq/pequalnp-proofs@$short](https://github.com/brilliant-hq/pequalnp-proofs/tree/$commit) |
-| Lean | $version (\`$lean_asset\`, as Lean publishes it) |
-| Mathlib | \`$mathlib_rev\`, from its prebuilt cache |
-| Check | elaborated \`import Mathlib.Logic.Basic\` and \`import $project_import\` from another folder, read only, in $seconds, peak $((peak_kb / 1024)) MB |
-
-| File | Bytes | sha256 |
-|---|---|---|
-| \`$lean_asset\` | $lean_bytes | \`$lean_sha\` |
-| \`$project_asset\` | $project_bytes | \`$project_sha\` |
-
-\`fetch.json\` is the two files as a desk's \`fetch\`; \`setup.txt\` is how an item runs Lean with them. Lean, Mathlib and pequalnp-proofs are each Apache-2.0; their licence files are inside the archives.
-EOF
+row() { printf '| `%s` | %s | `%s` |\n' "$1" "$(stat -c %s "$out/$1")" "$(sha256sum "$out/$1" | cut -d' ' -f1)"; }
+{
+  echo "Prebuilt Lean files for IMD's outside proof desk on [pequalnp.com](https://pequalnp.com), built by this repository's workflow on GitHub's runner."
+  echo
+  echo "| | |"
+  echo "|---|---|"
+  echo "| Project | [brilliant-hq/pequalnp-proofs@$short](https://github.com/brilliant-hq/pequalnp-proofs/tree/$commit) |"
+  echo "| Lean | $version (\`$lean_asset\`, as Lean publishes it) |"
+  echo "| Mathlib | \`$mathlib_rev\`, from its prebuilt cache |"
+  echo "| Check | \`import $mathlib_import\` and \`import $project_import\` elaborated from another folder, read only, in $seconds, peak $((peak_kb / 1024)) MB |"
+  echo
+  echo "| File | Bytes | sha256 |"
+  echo "|---|---|---|"
+  row "$lean_asset"; row "$packages_asset"; row "$project_asset"
+  echo
+  echo "\`fetch.json\` is the three files as a desk's \`fetch\`; \`setup.txt\` is how an item runs Lean with them. Lean, Mathlib and pequalnp-proofs are each Apache-2.0; their licence files are inside the archives."
+} > "$out/notes.md"
 cat "$out/notes.md"

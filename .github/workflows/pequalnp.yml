@@ -47,6 +47,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ steps.bundle.outputs.release }}
           LEAN_ASSET: ${{ steps.bundle.outputs.lean_asset }}
+          PACKAGES_ASSET: ${{ steps.bundle.outputs.packages_asset }}
           PROJECT_ASSET: ${{ steps.bundle.outputs.project_asset }}
         run: |
           cd "$RUNNER_TEMP/out"
@@ -55,4 +56,4 @@ jobs:
             exit 1
           fi
           gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --notes-file notes.md \
-            "$LEAN_ASSET" "$PROJECT_ASSET" fetch.json setup.txt
+            "$LEAN_ASSET" "$PACKAGES_ASSET" "$PROJECT_ASSET" fetch.json setup.txt
