@@ -14,8 +14,9 @@ The first desk is [pequalnp.com](https://pequalnp.com), whose proofs go to
    the built project, keeping everything but git folders (Mathlib's module system reads its IR files at run time);
 5. elaborates a check file in the built project, then unpacks the three in another folder, makes them read only, moves the build away, and elaborates a file importing
    Mathlib and the project there, so a bundle that depends on the runner's paths or writes anything fails;
-6. unpacks every file with the newest released IMD worker's own reader (`scripts/worker-unpack.mjs`), exactly as a machine
-   does before an item starts, and stops if the worker refuses one;
+6. holds every file to the IMD worker's reader, rule by rule (`scripts/check-bundle.py`): no member that names the
+   archive's own root, leaves it or is a device or pipe, no link out of it or to nowhere, at most 200,000 members and
+   the size the worker's cache takes; a file the worker would refuse is not published;
 7. publishes a release `pequalnp-<commit>` with the three files, `fetch.json` (them as a desk's `fetch`, with their
    sha256 and sizes) and `setup.txt` (how an item runs Lean with them). A published release is never replaced.
 

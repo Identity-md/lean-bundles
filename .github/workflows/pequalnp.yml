@@ -1,6 +1,6 @@
 # Builds and publishes the prebuilt Lean files IMD's pequalnp.com desk runs on (scripts/pequalnp.sh), for one commit of
-# open-goat/pequalnp-proofs (brilliant-hq/pequalnp-proofs until 2026-11-22), and publishes them only once the released
-# IMD worker's own reader has unpacked every one (scripts/worker-unpack.mjs). Run by hand:
+# open-goat/pequalnp-proofs (brilliant-hq/pequalnp-proofs until 2026-11-22), and publishes them only once each holds to
+# the IMD worker's reader, rule by rule (scripts/check-bundle.py). Run by hand:
 # gh workflow run pequalnp.yml -f ref=<commit, branch or tag>.
 name: pequalnp bundle
 
@@ -36,9 +36,6 @@ jobs:
           ref: ${{ inputs.ref }}
           path: project
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24
       - name: Make room
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -47,20 +44,19 @@ jobs:
       - name: Build, pack and check
         id: bundle
         run: bash bundles/scripts/pequalnp.sh "$GITHUB_WORKSPACE/project" "$RUNNER_TEMP/out"
-      # What a machine does before an item starts, with the newest released worker: a bundle it refuses is not published.
-      - name: Unpack every bundle with the released IMD worker's own reader
+      # What a machine's reader refuses, before an item starts (2026-11-25: a ./ member failed every item): a bundle it
+      # would refuse is not published.
+      - name: Hold every bundle to the IMD worker's reader
         env:
-          GH_TOKEN: ${{ github.token }}
+          LEAN_ASSET: ${{ steps.bundle.outputs.lean_asset }}
+          PACKAGES_ASSET: ${{ steps.bundle.outputs.packages_asset }}
+          PROJECT_ASSET: ${{ steps.bundle.outputs.project_asset }}
         run: |
-          sudo rm -rf "$RUNNER_TEMP/check" "$RUNNER_TEMP/in-place" "$RUNNER_TEMP/toolchain" "$RUNNER_TEMP/toolchain.moved" \
-            "$GITHUB_WORKSPACE/project" "$GITHUB_WORKSPACE/project.moved"
-          df -h /
-          mkdir -p "$RUNNER_TEMP/worker" && cd "$RUNNER_TEMP/worker"
-          gh release download --repo Identity-md/worker --pattern identitymd-worker.tgz --pattern SHA256SUMS
-          grep ' identitymd-worker.tgz$' SHA256SUMS | sha256sum -c -
-          npm install --global --no-fund --no-audit ./identitymd-worker.tgz
-          imd --version || true
-          node "$GITHUB_WORKSPACE/bundles/scripts/worker-unpack.mjs" "$(npm root --global)/@identitymd/worker" "$RUNNER_TEMP/out" "$RUNNER_TEMP/worker-home"
+          cd "$RUNNER_TEMP/out"
+          for asset in "$LEAN_ASSET" "$PACKAGES_ASSET" "$PROJECT_ASSET"; do
+            echo "$asset"
+            zstd -dc "$asset" | python3 -I "$GITHUB_WORKSPACE/bundles/scripts/check-bundle.py" "$(stat -c %s "$asset")"
+          done
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
