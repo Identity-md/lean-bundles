@@ -70,5 +70,17 @@ jobs:
             echo "::error::$RELEASE is already published; a release is never replaced"
             exit 1
           fi
-          gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --notes-file notes.md \
-            "$LEAN_ASSET" "$PACKAGES_ASSET" "$PROJECT_ASSET" fetch.json setup.txt
+          # GitHub answered HTTP 500 to a release's creation once (run 45646758688, 2026-11-25): asked again twice, and
+          # never over a release that was made in part, which is looked at by hand rather than replaced.
+          for attempt in 1 2 3; do
+            if gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --notes-file notes.md \
+              "$LEAN_ASSET" "$PACKAGES_ASSET" "$PROJECT_ASSET" fetch.json setup.txt; then
+              exit 0
+            fi
+            sleep 30
+            if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::$RELEASE was made in part; look at it before running this again"
+              exit 1
+            fi
+          done
+          exit 1
