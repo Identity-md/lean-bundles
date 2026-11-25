@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds brilliant-hq/pequalnp-proofs' Lean project against Mathlib's prebuilt cache and packs three bundles for IMD's
+# Builds open-goat/pequalnp-proofs' Lean project against Mathlib's prebuilt cache and packs three bundles for IMD's
 # outside proof desks: the Lean toolchain the project names, as Lean publishes it (`lean`); the project's packages,
 # Mathlib and what it needs, built (`lean-packages`); and the project itself, built (`pequalnp`). Nothing built is left
 # out but the git folders: Mathlib uses Lean's module system, whose interpreter reads the IR files beside the .olean
@@ -133,13 +133,22 @@ bash -n "$root/imd-env.sh"
 echo "::group::Pack"
 find "$root/.lake" -name .git -prune -exec rm -rf {} +
 rm -rf "$root/.git"
-pack() { tar --sort=name --owner=0 --group=0 --numeric-owner "$@" | zstd -T0 -15 -q -o "$out/$asset"; }
-asset=$packages_asset pack -C "$root/.lake/packages" -cf - .
-asset=$project_asset pack -C "$root" --exclude=./.lake/packages -cf - .
+# Each folder's entries by name, never `.` itself: a member `./` names the archive's own root, which the IMD worker's
+# reader refuses (2026-11-25, pequalnp-4338f185cda1: "lean-packages: the archive names "./", outside its own root").
+pack() {
+  local dir=$1; shift
+  (cd "$dir" && find . -mindepth 1 -maxdepth 1 -printf '%P\0' | LC_ALL=C sort -z) \
+    | tar --sort=name --owner=0 --group=0 --numeric-owner -C "$dir" "$@" --null -T - -cf - | zstd -T0 -15 -q -o "$out/$asset"
+}
+asset=$packages_asset pack "$root/.lake/packages"
+asset=$project_asset pack "$root" --exclude=.lake/packages
 for asset in "$lean_asset" "$packages_asset" "$project_asset"; do
   size=$(stat -c %s "$out/$asset")
   echo "$asset: $size bytes"
   if [ "$size" -gt "$max_asset" ]; then echo "::error::$asset is $size bytes, past a release file's 2 GiB"; exit 1; fi
+  # What the worker's reader refuses by name alone: the root itself, an absolute path, a step up, and devices or pipes.
+  bad=$({ tar --zstd -tf "$out/$asset" | grep -E '^\.?/?$|^/|(^|/)\.\.(/|$)' || true; tar --zstd -tvf "$out/$asset" | grep -E '^[bcp]' || true; } | head -5 || true)
+  if [ -n "$bad" ]; then echo "::error::$asset holds members the IMD worker refuses:"; echo "$bad"; exit 1; fi
 done
 echo "::endgroup::"
 
@@ -205,7 +214,7 @@ row() { printf '| `%s` | %s | `%s` |\n' "$1" "$(stat -c %s "$out/$1")" "$(sha256
   echo
   echo "| | |"
   echo "|---|---|"
-  echo "| Project | [brilliant-hq/pequalnp-proofs@$short](https://github.com/brilliant-hq/pequalnp-proofs/tree/$commit) |"
+  echo "| Project | [open-goat/pequalnp-proofs@$short](https://github.com/open-goat/pequalnp-proofs/tree/$commit) |"
   echo "| Lean | $version (\`$lean_asset\`, as Lean publishes it) |"
   echo "| Mathlib | \`$mathlib_rev\`, from its prebuilt cache |"
   echo "| Check | \`import $mathlib_import\` and \`import $project_import\` elaborated from another folder, read only, in $seconds, peak $((peak_kb / 1024)) MB |"
