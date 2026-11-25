@@ -64,23 +64,40 @@ jobs:
           LEAN_ASSET: ${{ steps.bundle.outputs.lean_asset }}
           PACKAGES_ASSET: ${{ steps.bundle.outputs.packages_asset }}
           PROJECT_ASSET: ${{ steps.bundle.outputs.project_asset }}
+        # A draft first, each file uploaded on its own and asked again on GitHub's failures, every size checked, and only
+        # then published: GitHub answered HTTP 500 to a release's creation and to a 1.8 GB upload during its incident of
+        # 2026-11-25, and gh left a draft holding four of the five files. A draft an earlier run left for the same commit
+        # is finished, its files replaced by this run's; a published release is never replaced.
         run: |
           cd "$RUNNER_TEMP/out"
-          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::$RELEASE is already published; a release is never replaced"
-            exit 1
-          fi
-          # GitHub answered HTTP 500 to a release's creation once (run 45646758688, 2026-11-25): asked again twice, and
-          # never over a release that was made in part, which is looked at by hand rather than replaced.
-          for attempt in 1 2 3; do
-            if gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" --title "$RELEASE" --notes-file notes.md \
-              "$LEAN_ASSET" "$PACKAGES_ASSET" "$PROJECT_ASSET" fetch.json setup.txt; then
-              exit 0
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "attempt $attempt failed; asking again in $((attempt * 60)) s"
+              sleep $((attempt * 60))
+            done
+            return 1
+          }
+          files=(fetch.json setup.txt "$LEAN_ASSET" "$PROJECT_ASSET" "$PACKAGES_ASSET")
+          if state=$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$state" != true ]; then
+              echo "::error::$RELEASE is already published; a release is never replaced"
+              exit 1
             fi
-            sleep 30
-            if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "::error::$RELEASE was made in part; look at it before running this again"
+            echo "$RELEASE is a draft an earlier run left: this run's files replace its own"
+            retry gh release edit "$RELEASE" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            retry gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" --draft --title "$RELEASE" --notes-file notes.md
+          fi
+          for file in "${files[@]}"; do
+            retry gh release upload "$RELEASE" "$file" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+          for file in "${files[@]}"; do
+            want=$(stat -c %s "$file")
+            got=$(retry gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[] | select(.name == \"$file\") | .size")
+            if [ "$got" != "$want" ]; then
+              echo "::error::$file is $got bytes on the draft, not $want; it stays a draft"
               exit 1
             fi
           done
-          exit 1
+          retry gh release edit "$RELEASE" --repo "$GITHUB_REPOSITORY" --draft=false --latest
