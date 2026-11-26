@@ -9,6 +9,11 @@
 # toolchain on PATH and the built libraries on LEAN_PATH, and `lean <file>` elaborates writing nothing. The check file
 # is elaborated twice before anything is published: in the built project through Lake, and then from the three bundles
 # unpacked in another folder, read only, with the build moved away, so a bundle leaning on this runner's paths fails.
+# Then, from the same folder, one of the project's accepted proofs that imports all of Mathlib, as a desk's check runs
+# it, so a bundle that cannot load the whole library on this runner's memory fails too.
+#
+# The chip is the runner's: linux-x64 on x86_64, linux-arm64 on aarch64 (GitHub's arm runner), each with its own Lean
+# as Lean publishes it and its own build, under the same three names, so a desk names the arm files beside the x64 ones.
 #
 #   bash scripts/pequalnp.sh <checkout of pequalnp-proofs> <output folder>
 set -euo pipefail
@@ -35,9 +40,15 @@ case "$toolchain" in
 esac
 tag=${toolchain#leanprover/lean4:}
 version=${tag#v}
-lean_asset="lean-$version-linux.tar.zst"
-packages_asset="pequalnp-$short-packages-lean-$version-linux-x64.tar.zst"
-project_asset="pequalnp-$short-lean-$version-linux-x64.tar.zst"
+case "$(uname -m)" in
+  x86_64) platform=linux-x64; lean_chip=linux ;;
+  aarch64 | arm64) platform=linux-arm64; lean_chip=linux_aarch64 ;;
+  *) echo "::error::no Lean release for $(uname -m)"; exit 1 ;;
+esac
+lean_asset="lean-$version-$lean_chip.tar.zst"
+packages_asset="pequalnp-$short-packages-lean-$version-$platform.tar.zst"
+project_asset="pequalnp-$short-lean-$version-$platform.tar.zst"
+echo "building for $platform"
 
 echo "::group::Lean $version"
 curl -fsSL --retry 3 -o "$out/$lean_asset" "https://github.com/leanprover/lean4/releases/download/$tag/$lean_asset"
@@ -152,6 +163,18 @@ for asset in "$lean_asset" "$packages_asset" "$project_asset"; do
 done
 echo "::endgroup::"
 
+# The full check: the smallest of the project's accepted proofs (under its Outside folder) that imports all of Mathlib, as
+# it is. Picked before the build is moved away.
+full_proof=$( (cd "$root" && grep -rlx --include='*.lean' 'import Mathlib' "$project_lib/Outside" 2>/dev/null || true) \
+  | while read -r file; do printf '%s %s\n' "$(stat -c %s "$root/$file")" "$file"; done | sort -n | head -n 1 | cut -d' ' -f2- || true)
+[ -n "$full_proof" ] || { echo "::error::no accepted proof under $project_lib/Outside imports all of Mathlib"; exit 1; }
+echo "the full check elaborates $full_proof"
+full_copy=$work/full.lean
+cp "$root/$full_proof" "$full_copy"
+full_url_path=${root#"$src"}
+full_url_path=${full_url_path#/}
+full_url_path=${full_url_path:+$full_url_path/}$full_proof
+
 echo "::group::Check from another folder, read only"
 check=$work/check
 fetch=$check/.imd/fetch
@@ -184,7 +207,33 @@ seconds=$(sed -n 's/.*Elapsed (wall clock) time (h:mm:ss or m:ss): //p' "$check_
 seconds=${seconds:-unmeasured}
 echo "::endgroup::"
 
+echo "::group::Full check: $full_proof, all of Mathlib, from the same folder"
+echo "runner: $(nproc) CPUs, $(free -m | awk '/^Mem:/ {print $2}') MB of memory"
+full_name=$(basename "$full_proof")
+cp "$full_copy" "$check/item/$full_name"
+full_log=$work/full.log
+(
+  cd "$check/item"
+  export PATH=$plain_path
+  export IMD_FETCH="$fetch"
+  . "$IMD_FETCH/pequalnp/imd-env.sh"
+  /usr/bin/time -v lean "$full_name"
+) > "$full_log" 2>&1 || {
+  cat "$full_log"
+  echo "::error::$full_proof did not elaborate from the bundles"
+  exit 1
+}
+cat "$full_log"
+if grep -q "declaration uses 'sorry'" "$full_log"; then echo "::error::$full_proof uses sorry"; exit 1; fi
+full_peak_kb=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "$full_log")
+full_peak_kb=${full_peak_kb:-0}
+full_seconds=$(sed -n 's/.*Elapsed (wall clock) time (h:mm:ss or m:ss): //p' "$full_log")
+full_seconds=${full_seconds:-unmeasured}
+echo "::endgroup::"
+
+# x64 keeps the name it always had; another chip's files are a release of their own beside it.
 release=pequalnp-$short
+[ "$platform" = linux-x64 ] || release=$release-$platform
 base="https://github.com/${GITHUB_REPOSITORY:-Identity-md/lean-bundles}/releases/download/$release"
 entry() {
   local name=$1 file=$2
@@ -206,23 +255,26 @@ EOF
   echo "lean_asset=$lean_asset"
   echo "packages_asset=$packages_asset"
   echo "project_asset=$project_asset"
+  echo "platform=$platform"
 } >> "${GITHUB_OUTPUT:-/dev/null}"
 
 row() { printf '| `%s` | %s | `%s` |\n' "$1" "$(stat -c %s "$out/$1")" "$(sha256sum "$out/$1" | cut -d' ' -f1)"; }
 {
-  echo "Prebuilt Lean files for IMD's outside proof desk on [pequalnp.com](https://pequalnp.com), built by this repository's workflow on GitHub's runner."
+  echo "Prebuilt Lean files for IMD's outside proof desk on [pequalnp.com](https://pequalnp.com), for $platform, built by this repository's workflow on GitHub's runner."
   echo
   echo "| | |"
   echo "|---|---|"
   echo "| Project | [open-goat/pequalnp-proofs@$short](https://github.com/open-goat/pequalnp-proofs/tree/$commit) |"
   echo "| Lean | $version (\`$lean_asset\`, as Lean publishes it) |"
   echo "| Mathlib | \`$mathlib_rev\`, from its prebuilt cache |"
+  echo "| Platform | \`$platform\` |"
   echo "| Check | \`import $mathlib_import\` and \`import $project_import\` elaborated from another folder, read only, in $seconds, peak $((peak_kb / 1024)) MB |"
+  echo "| Full check | [\`$full_proof\`](https://github.com/open-goat/pequalnp-proofs/blob/$commit/$full_url_path), which imports all of Mathlib, elaborated the same way in $full_seconds, peak $((full_peak_kb / 1024)) MB |"
   echo
   echo "| File | Bytes | sha256 |"
   echo "|---|---|---|"
   row "$lean_asset"; row "$packages_asset"; row "$project_asset"
   echo
-  echo "\`fetch.json\` is the three files as a desk's \`fetch\`; \`setup.txt\` is how an item runs Lean with them. Lean, Mathlib and pequalnp-proofs are each Apache-2.0; their licence files are inside the archives."
+  echo "\`fetch.json\` is the three files as a desk's \`fetch\` (for another chip than linux-x64, its \`fetchByPlatform\` entry); \`setup.txt\` is how an item runs Lean with them. Lean, Mathlib and pequalnp-proofs are each Apache-2.0; their licence files are inside the archives."
 } > "$out/notes.md"
 cat "$out/notes.md"

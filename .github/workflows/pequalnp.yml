@@ -1,7 +1,7 @@
 # Builds and publishes the prebuilt Lean files IMD's pequalnp.com desk runs on (scripts/pequalnp.sh), for one commit of
 # open-goat/pequalnp-proofs (brilliant-hq/pequalnp-proofs until 2026-11-22), and publishes them only once each holds to
-# the IMD worker's reader, rule by rule (scripts/check-bundle.py). Run by hand:
-# gh workflow run pequalnp.yml -f ref=<commit, branch or tag>.
+# the IMD worker's reader, rule by rule (scripts/check-bundle.py). Run by hand, once a chip:
+# gh workflow run pequalnp.yml -f ref=<commit, branch or tag> [-f platform=linux-arm64].
 name: pequalnp bundle
 
 on:
@@ -11,17 +11,22 @@ on:
         description: open-goat/pequalnp-proofs commit, branch or tag to build
         required: true
         default: main
+      platform:
+        description: the chip the files are built for, on GitHub's runner of that chip
+        type: choice
+        options: [linux-x64, linux-arm64]
+        default: linux-x64
 
 permissions:
   contents: read
 
 concurrency:
-  group: pequalnp-bundle
+  group: pequalnp-bundle-${{ inputs.platform }}
   cancel-in-progress: false
 
 jobs:
   bundle:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 150
     permissions:
       contents: write
@@ -64,6 +69,7 @@ jobs:
           LEAN_ASSET: ${{ steps.bundle.outputs.lean_asset }}
           PACKAGES_ASSET: ${{ steps.bundle.outputs.packages_asset }}
           PROJECT_ASSET: ${{ steps.bundle.outputs.project_asset }}
+          PLATFORM: ${{ steps.bundle.outputs.platform }}
         # A draft first, each file uploaded on its own and asked again on GitHub's failures, every size checked, and only
         # then published: GitHub answered HTTP 500 to a release's creation and to a 1.8 GB upload during its incident of
         # 2026-11-25, and gh left a draft holding four of the five files. A draft an earlier run left for the same commit
@@ -100,4 +106,6 @@ jobs:
               exit 1
             fi
           done
-          retry gh release edit "$RELEASE" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          # Latest stays the linux-x64 release, which a desk's `fetch` names; another chip's sits beside it.
+          if [ "$PLATFORM" = linux-x64 ]; then latest=--latest; else latest=--latest=false; fi
+          retry gh release edit "$RELEASE" --repo "$GITHUB_REPOSITORY" --draft=false "$latest"

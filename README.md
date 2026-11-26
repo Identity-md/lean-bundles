@@ -13,16 +13,22 @@ The first desk is [pequalnp.com](https://pequalnp.com), whose proofs go to
 4. packs three `tar.zst` files, each under 2 GiB, naming each folder's entries and never the folder itself (`./`): the toolchain, the built packages (Mathlib and what it needs), and
    the built project, keeping everything but git folders (Mathlib's module system reads its IR files at run time);
 5. elaborates a check file in the built project, then unpacks the three in another folder, makes them read only, moves the build away, and elaborates a file importing
-   Mathlib and the project there, so a bundle that depends on the runner's paths or writes anything fails;
+   Mathlib and the project there, so a bundle that depends on the runner's paths or writes anything fails; then, the same way, the smallest
+   of the project's accepted proofs that imports all of Mathlib, as a desk's check runs it, with its time and peak memory in the notes;
 6. holds every file to the IMD worker's reader, rule by rule (`scripts/check-bundle.py`): no member that names the
    archive's own root, leaves it or is a device or pipe, no link out of it or to nowhere, at most 200,000 members and
    the size the worker's cache takes; a file the worker would refuse is not published;
-7. publishes a release `pequalnp-<commit>` with the three files, `fetch.json` (them as a desk's `fetch`, with their
+7. publishes a release `pequalnp-<commit>` (`pequalnp-<commit>-linux-arm64` for Apple-chip and other arm machines) with the three files, `fetch.json` (them as a desk's `fetch`, with their
    sha256 and sizes) and `setup.txt` (how an item runs Lean with them). A published release is never replaced.
 
 ```sh
 gh workflow run pequalnp.yml -R Identity-md/lean-bundles -f ref=<commit, branch or tag>
+gh workflow run pequalnp.yml -R Identity-md/lean-bundles -f ref=<commit> -f platform=linux-arm64
 ```
+
+Each chip builds on GitHub's runner of that chip (`ubuntu-24.04`, `ubuntu-24.04-arm`), with Lean's own release for it
+and the same three names, so an arm release's `fetch.json` is a desk's `fetchByPlatform["linux-arm64"]` as it is. The
+linux-x64 release stays the latest.
 
 An IMD plane takes these files only when its operator names this repository's releases in `GOAL_FETCH_SOURCES`, and
 each machine checks every file's size and sha256 before it unpacks it.
